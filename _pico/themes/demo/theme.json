@@ -1,0 +1,8 @@
+{
+  "type": "material",
+  "name": "Demo (Pink Icon)",
+  "description": "Demo theme for per-folder icon overrides.",
+  "author": "MelodicPlatypus",
+  "primaryColor": { "r": 236, "g": 72, "b": 153 },
+  "darkTheme": true
+}

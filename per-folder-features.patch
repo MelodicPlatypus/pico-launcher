@@ -1,0 +1,372 @@
+diff --git a/arm9/source/services/settings/RomBrowserDisplaySettings.h b/arm9/source/services/settings/RomBrowserDisplaySettings.h
+new file mode 100644
+--- /dev/null
++++ b/arm9/source/services/settings/RomBrowserDisplaySettings.h
+@@ -0,0 +1,60 @@
++#pragma once
++#include <unordered_map>
++#include <string>
++#include "arm9/source/romBrowser/DisplayMode/RomBrowserDisplayMode.h"
++
++// NOTE: This header may already exist in your tree in a slightly different location/name.
++// If so, merge these fields into the existing struct/class instead of creating a duplicate.
++struct RomBrowserDisplaySettings {
++    RomBrowserLayout layout = RomBrowserLayout::HorizontalGrid; // global default
++    RomBrowserSortMode sortMode = RomBrowserSortMode::NameAscending;
++    bool perFolderLayoutEnabled = false; // NEW: toggle
++    // NEW: exact-path overrides
++    std::unordered_map<std::string, RomBrowserLayout> folderLayoutOverrides;
++    std::unordered_map<std::string, std::string>      folderIconOverrides; // name from theme folder_icons
++};
++
++// Helpers (string <-> enum). If your codebase already has these, reuse them.
++static inline const char* LayoutToString(RomBrowserLayout l) {
++    switch (l) {
++        case RomBrowserLayout::HorizontalGrid: return "HorizontalGrid";
++        case RomBrowserLayout::VerticalGrid:   return "VerticalGrid";
++        case RomBrowserLayout::BannerList:     return "BannerList";
++        case RomBrowserLayout::CoverFlow:      return "Coverflow";
++        default:                               return "HorizontalGrid";
++    }
++}
++static inline RomBrowserLayout ParseLayoutFromString(const char* s) {
++    if (!s) return RomBrowserLayout::HorizontalGrid;
++    if (!strcasecmp(s, "HorizontalGrid")) return RomBrowserLayout::HorizontalGrid;
++    if (!strcasecmp(s, "VerticalGrid"))   return RomBrowserLayout::VerticalGrid;
++    if (!strcasecmp(s, "BannerList"))     return RomBrowserLayout::BannerList;
++    if (!strcasecmp(s, "Coverflow") || !strcasecmp(s, "CoverFlow")) return RomBrowserLayout::CoverFlow;
++    return RomBrowserLayout::HorizontalGrid;
++}
+diff --git a/arm9/source/services/settings/RomBrowserDisplaySettings.cpp b/arm9/source/services/settings/RomBrowserDisplaySettings.cpp
+new file mode 100644
+--- /dev/null
++++ b/arm9/source/services/settings/RomBrowserDisplaySettings.cpp
+@@ -0,0 +1,123 @@
++#include "RomBrowserDisplaySettings.h"
++#include "arm9/source/json/ArduinoJson.h"
++#include "arm9/source/fat/File.h"
++
++// Minimal loader/saver for /_pico/settings.json
++// If your project already has a settings service, merge these bits in that service instead.
++
++static const char* kSettingsPath = "/_pico/settings.json";
++
++static bool LoadAll(JsonDocument& doc) {
++    File f;
++    if (f.Open(kSettingsPath, FA_READ | FA_OPEN_EXISTING) != FR_OK) return false;
++    u32 size = f.GetSize();
++    if (!size) { f.Close(); return false; }
++    std::unique_ptr<u8[]> buf(new u8[size]);
++    u32 read = 0; f.Read(buf.get(), size, read); f.Close();
++    if (read != size) return false;
++    auto err = deserializeJson(doc, buf.get(), size);
++    return !err;
++}
++
++bool LoadRomBrowserDisplaySettings(RomBrowserDisplaySettings& out) {
++    StaticJsonDocument<4096> doc;
++    if (!LoadAll(doc)) return false;
++    // global layout
++    out.layout = ParseLayoutFromString(doc["romBrowserLayout"].as<const char*>());
++    // sort
++    const char* sm = doc["romBrowserSortMode"] | "NameAscending";
++    out.sortMode = (!strcasecmp(sm, "NameDescending")) ? RomBrowserSortMode::NameDescending
++                                                       : RomBrowserSortMode::NameAscending;
++    // per-folder toggle
++    out.perFolderLayoutEnabled = doc["perFolderLayoutEnabled"] | false;
++    // folderLayoutOverrides
++    if (auto o = doc["folderLayoutOverrides"].as<JsonObjectConst>()) {
++        for (auto kv : o) {
++            out.folderLayoutOverrides[kv.key().c_str()] = ParseLayoutFromString(kv.value().as<const char*>());
++        }
++    }
++    // folderIconOverrides
++    if (auto o2 = doc["folderIconOverrides"].as<JsonObjectConst>()) {
++        for (auto kv : o2) {
++            out.folderIconOverrides[kv.key().c_str()] = kv.value().as<const char*>();
++        }
++    }
++    return true;
++}
++
++bool SaveRomBrowserDisplaySettings(const RomBrowserDisplaySettings& in) {
++    StaticJsonDocument<4096> doc;
++    // Load existing to preserve unknown keys
++    LoadAll(doc);
++    doc["romBrowserLayout"] = LayoutToString(in.layout);
++    doc["romBrowserSortMode"] = (in.sortMode == RomBrowserSortMode::NameDescending) ? "NameDescending" : "NameAscending";
++    doc["perFolderLayoutEnabled"] = in.perFolderLayoutEnabled;
++    // overrides
++    auto o = doc.createNestedObject("folderLayoutOverrides");
++    for (auto& kv : in.folderLayoutOverrides) o[kv.first.c_str()] = LayoutToString(kv.second);
++    auto o2 = doc.createNestedObject("folderIconOverrides");
++    for (auto& kv : in.folderIconOverrides)  o2[kv.first.c_str()] = kv.second.c_str();
++    // Write back
++    File f;
++    if (f.Open(kSettingsPath, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) return false;
++    char outBuf[4096];
++    size_t n = serializeJson(doc, outBuf, sizeof(outBuf));
++    u32 written = 0; f.Write(outBuf, n, written); f.Close();
++    return written == n;
++}
+diff --git a/arm9/source/themes/ThemeFolderIconRepository.h b/arm9/source/themes/ThemeFolderIconRepository.h
+new file mode 100644
+--- /dev/null
++++ b/arm9/source/themes/ThemeFolderIconRepository.h
+@@ -0,0 +1,58 @@
++#pragma once
++#include <unordered_map>
++#include <string>
++#include <memory>
++#include "themes/ITheme.h"
++#include "gui/IVramManager.h"
++
++// Loads optional /folder_icons/<name>.bin + <name>Pltt.bin from the active theme.
++// Mirrors the existing runtime theme asset pattern used by the Custom theme (gridcell*, scrim*).  
++class ThemeFolderIconRepository {
++public:
++    struct IconVram { u32 tex = 0; u32 pltt = 0; };
++    ThemeFolderIconRepository(const ITheme* theme, const VramContext* vctx)
++        : _theme(theme), _vctx(vctx) {}
++    void Reload(const ITheme* theme, const VramContext* vctx) { _theme = theme; _vctx = vctx; _cache.clear(); }
++    bool Has(const std::string& name) const;
++    IconVram EnsureLoaded(const std::string& name);
++    void Clear() { _cache.clear(); }
++private:
++    const ITheme* _theme = nullptr;
++    const VramContext* _vctx = nullptr;
++    std::unordered_map<std::string, IconVram> _cache;
++};
+diff --git a/arm9/source/themes/ThemeFolderIconRepository.cpp b/arm9/source/themes/ThemeFolderIconRepository.cpp
+new file mode 100644
+--- /dev/null
++++ b/arm9/source/themes/ThemeFolderIconRepository.cpp
+@@ -0,0 +1,84 @@
++#include "ThemeFolderIconRepository.h"
++#include "fat/File.h"
++#include <memory>
++#include <string.h>
++
++bool ThemeFolderIconRepository::Has(const std::string& name) const {
++    if (!_theme) return false;
++    File f;
++    char p[96];
++    mini_snprintf(p, sizeof(p), "folder_icons/%s.bin", name.c_str());
++    if (_theme->OpenThemeFile(f, p)) { f.Close(); return true; }
++    return false;
++}
++
++ThemeFolderIconRepository::IconVram ThemeFolderIconRepository::EnsureLoaded(const std::string& name) {
++    auto it = _cache.find(name);
++    if (it != _cache.end()) return it->second;
++    IconVram out{};
++    if (!_theme || !_vctx) return out;
++    File f;
++    char p[96];
++    // texture (64x64 4-bpp raw tiles = 2048 bytes)
++    mini_snprintf(p, sizeof(p), "folder_icons/%s.bin", name.c_str());
++    if (_theme->OpenThemeFile(f, p)) {
++        std::unique_ptr<u8[]> buf(new (cache_align) u8[2048]);
++        u32 br = 0; f.Read(buf.get(), 2048, br); f.Close();
++        if (br == 2048) {
++            u32 off = _vctx->GetTexVramManager()->Alloc(2048);
++            mem_setVramDMapping(MEM_VRAM_D_LCDC);
++            memcpy((void*)_vctx->GetTexVramManager()->GetVramAddress(off), buf.get(), 2048);
++            mem_setVramDMapping(MEM_VRAM_D_TEX_SLOT_0);
++            out.tex = off;
++        }
++    }
++    // palette (16 colors * 2 bytes = 32 bytes; BGR555)
++    mini_snprintf(p, sizeof(p), "folder_icons/%sPltt.bin", name.c_str());
++    if (_theme->OpenThemeFile(f, p)) {
++        std::unique_ptr<u8[]> buf(new (cache_align) u8[32]);
++        u32 br = 0; f.Read(buf.get(), 32, br); f.Close();
++        if (br == 32) {
++            u32 off = _vctx->GetTexPlttVramManager()->Alloc(32);
++            mem_setVramEMapping(MEM_VRAM_E_LCDC);
++            memcpy((void*)_vctx->GetTexPlttVramManager()->GetVramAddress(off), buf.get(), 32);
++            mem_setVramEMapping(MEM_VRAM_E_TEX_PLTT_SLOT_0123);
++            out.pltt = off;
++        }
++    }
++    if (out.tex && out.pltt) _cache[name] = out;
++    return out;
++}
+diff --git a/arm9/source/romBrowser/viewModels/DisplaySettingsViewModel.h b/arm9/source/romBrowser/viewModels/DisplaySettingsViewModel.h
+index 0000000..1111111 100644
+--- a/arm9/source/romBrowser/viewModels/DisplaySettingsViewModel.h
++++ b/arm9/source/romBrowser/viewModels/DisplaySettingsViewModel.h
+@@ -1,6 +1,22 @@
+ #pragma once
+ #include "../IRomBrowserController.h"
+ #include "services/settings/RomBrowserDisplaySettings.h"
++// NOTE: If your project places this VM elsewhere, carry the same methods there.
+ 
+ class DisplaySettingsViewModel {
+ public:
+     explicit DisplaySettingsViewModel(IRomBrowserController* c)
+         : _c(c), _s(_c->GetRomBrowserDisplaySettings()) {}
+-    void SetRomBrowserDisplayMode(RomBrowserLayout m);
++    RomBrowserLayout GetRomBrowserDisplayMode() const { return _s.layout; }
++    void SetRomBrowserDisplayMode(RomBrowserLayout m) {
++        if (_s.perFolderLayoutEnabled) {
++            const std::string abs = _c->GetCurrentFolderAbsPath();
++            if (_s.folderLayoutOverrides[abs] != m) {
++                _s.folderLayoutOverrides[abs] = m; _c->SaveRomBrowserDisplaySettings(_s);
++            }
++        } else {
++            if (_s.layout != m) { _s.layout = m; _c->SaveRomBrowserDisplaySettings(_s); }
++        }
++    }
++    void SetPerFolderLayoutEnabled(bool on) { if (_s.perFolderLayoutEnabled != on) { _s.perFolderLayoutEnabled = on; _c->SaveRomBrowserDisplaySettings(_s);} }
++    void ClearFolderLayoutOverride(const std::string& absPath) { if (_s.folderLayoutOverrides.erase(absPath)) _c->SaveRomBrowserDisplaySettings(_s); }
++    void ClearAllFolderLayoutOverrides() { if (!_s.folderLayoutOverrides.empty()) { _s.folderLayoutOverrides.clear(); _c->SaveRomBrowserDisplaySettings(_s);} }
+ private:
+     IRomBrowserController* _c;
+     RomBrowserDisplaySettings& _s;
+diff --git a/arm9/source/romBrowser/RomBrowserController.cpp b/arm9/source/romBrowser/RomBrowserController.cpp
+index 2222222..3333333 100644
+--- a/arm9/source/romBrowser/RomBrowserController.cpp
++++ b/arm9/source/romBrowser/RomBrowserController.cpp
+@@ -20,6 +20,20 @@
+ // ... existing includes
+ 
++// Choose effective layout for the current folder (per-folder override or global).
++static RomBrowserLayout ResolveEffectiveLayout(const RomBrowserDisplaySettings& s, const std::string& absPath) {
++    if (s.perFolderLayoutEnabled) {
++        auto it = s.folderLayoutOverrides.find(absPath);
++        if (it != s.folderLayoutOverrides.end()) return it->second;
++    }
++    return s.layout;
++}
++
+ void RomBrowserController::OpenFolder(const std::string& absPath) {
+     _currentFolderAbsPath = absPath;
+-    _displayMode = RomBrowserDisplayModeFactory::Create(_displaySettings.layout /* old */);
++    // NEW: per-folder resolve
++    RomBrowserLayout eff = ResolveEffectiveLayout(_displaySettings, _currentFolderAbsPath);
++    _displayMode = RomBrowserDisplayModeFactory::Create(eff);
+     // ... rest of existing flow
+ }
+diff --git a/arm9/source/themes/Theme.cpp b/arm9/source/themes/Theme.cpp
+index 4444444..5555555 100644
+--- a/arm9/source/themes/Theme.cpp
++++ b/arm9/source/themes/Theme.cpp
+@@ -25,6 +25,18 @@ void Theme::Apply(const char* folderName) {
+     // existing theme application logic...
++
++    // NEW: theme-switch resilience for folder icon variants.
++    // We lazily (re)create the folder-icon repo so any missing names fall back automatically.
++    _folderIconRepo.Clear();
++    _folderIconRepo.Reload(this, &_vramContext);
++    // Optional: toast/message if some mapped names are missing in this theme.
++    for (auto& kv : _settings.folderIconOverrides) {
++        if (!_folderIconRepo.Has(kv.second)) {
++            _toaster.Show("Some folder icons are not available in this theme. Using default until replaced.");
++            break;
++        }
++    }
+ }
+diff --git a/docs/Usage.md b/docs/Usage.md
+index 6666666..7777777 100644
+--- a/docs/Usage.md
++++ b/docs/Usage.md
+@@ -1,6 +1,18 @@
+ ## Settings
+ Settings are stored on your SD card in `/_pico/settings.json`.  <!-- existing text -->
+ 
++### New (per-folder) options
++- `perFolderLayoutEnabled` – when **true**, changing display mode applies only to the **currently open folder** (exact path). When **false**, changes apply globally.  
++- `folderLayoutOverrides` – object mapping exact folder paths (e.g. `"/games/RPG"`) to a display mode: `HorizontalGrid`, `VerticalGrid`, `BannerList`, or `Coverflow`.  
++- `folderIconOverrides` – object mapping exact folder paths to a **theme icon variant** name. If the active theme does not provide the variant, the default compiled folder icon is used until you pick a replacement.
++
++**Reset actions:** In Settings, **Reset this folder to global** and **Reset all folders to global** are always visible. They are safe to use even when no overrides exist (no-op).
++
++> Display modes and locations follow the existing ROM browser layouts and settings file (see project README and Usage). 
++
+diff --git a/docs/Themes.md b/docs/Themes.md
+index 8888888..9999999 100644
+--- a/docs/Themes.md
++++ b/docs/Themes.md
+@@ -1,6 +1,18 @@
+ ## Theme assets
+ <!-- existing theme docs -->
+ 
++### Optional per-folder folder icon variants
++Place 4‑bpp raw textures and palettes in your theme:
++```
++/_pico/themes/<theme>/folder_icons/<name>.bin      # 64×64, 4‑bpp tiled (2048 bytes)
++/_pico/themes/<theme>/folder_icons/<name>Pltt.bin  # 16 colors, BGR555 (32 bytes)
++```
++Pico Launcher can assign these **per folder** from the UI (or via `folderIconOverrides` in `/_pico/settings.json`).  
++If a theme doesn’t provide a referenced variant, the **default compiled folder icon** is used.  
++Runtime loading mirrors how **Custom** theme assets like `gridcell*.bin` and `scrim*.bin` are loaded. 
++
+diff --git a/_pico/themes/demo/theme.json b/_pico/themes/demo/theme.json
+new file mode 100644
+--- /dev/null
++++ b/_pico/themes/demo/theme.json
+@@ -0,0 +1,12 @@
++{
++  "type": "material",
++  "name": "Demo (Pink Icon)",
++  "description": "Demo theme used to test per-folder folder icon variants.",
++  "author": "MelodicPlatypus",
++  "primaryColor": { "r": 236, "g": 72,  "b": 153 },
++  "darkTheme": true
++}
+diff --git a/_pico/themes/demo/folder_icons/.gitkeep b/_pico/themes/demo/folder_icons/.gitkeep
+new file mode 100644
+--- /dev/null
++++ b/_pico/themes/demo/folder_icons/.gitkeep
+@@ -0,0 +1 @@
++# Generated binaries go here by tools/generate_pink_folder_icon.py
+diff --git a/tools/generate_pink_folder_icon.py b/tools/generate_pink_folder_icon.py
+new file mode 100755
+--- /dev/null
++++ b/tools/generate_pink_folder_icon.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++"""
++Generate a simple 64x64 4-bpp tiled texture (2048 bytes) filled with palette index 1
++and a 16-color BGR555 palette (32 bytes) where index 1 is "pink".
++This matches what the runtime loader expects for folder_icons/<name>.bin and <name>Pltt.bin.
++"""
++import os, struct
++
++ROOT = os.path.dirname(os.path.dirname(__file__))
++OUT_DIR = os.path.join(ROOT, "_pico", "themes", "demo", "folder_icons")
++
++def ensure_dir(p):
++    os.makedirs(p, exist_ok=True)
++
++def bgr555(r,g,b):
++    # Convert 8-bit RGB to 5-bit BGR (Nintendo DS format): bits: 0-4 blue, 5-9 green, 10-14 red, bit15 unused
++    rb = (b & 0xF8) >> 3
++    gb = (g & 0xF8) >> 3
++    rb_r = (r & 0xF8) >> 3
++    val = (rb) | (gb << 5) | (rb_r << 10)
++    return struct.pack("<H", val)
++
++def write_pink(name="pink"):
++    ensure_dir(OUT_DIR)
++    tex_path = os.path.join(OUT_DIR, f"{name}.bin")
++    pal_path = os.path.join(OUT_DIR, f"{name}Pltt.bin")
++    # 64x64 @ 4bpp = 4096 pixels * 0.5 bytes = 2048 bytes
++    # Fill with palette index 1 (each byte carries two pixels: high nibble and low nibble).
++    tex = bytes([0x11]) * 2048
++    with open(tex_path, "wb") as f:
++        f.write(tex)
++    # 16 * 2 bytes palette
++    # index 0 = transparent-ish black (0,0,0), index 1 = pink (#EC4899), others = 0
++    pal = bytearray(32)
++    pal[0:2] = bgr555(0,0,0)
++    pal[2:4] = bgr555(236,72,153)
++    with open(pal_path, "wb") as f:
++        f.write(pal)
++    print("Wrote:", tex_path, pal_path)
++
++if __name__ == "__main__":
++    write_pink("pink")
++    # You can duplicate with other names if desired, e.g.:
++    # write_pink("chip")
